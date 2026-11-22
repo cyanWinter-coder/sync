@@ -5,11 +5,9 @@
 package singleflight
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -284,109 +282,577 @@ func TestGoexitDo(t *testing.T) {
 	}
 }
 
-func executable(t testing.TB) string {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Skipf("skipping: test executable not found")
-	}
-
-	// Control case: check whether exec.Command works at all.
-	// (For example, it might fail with a permission error on iOS.)
-	cmd := exec.Command(exe, "-test.list=^$")
-	cmd.Env = []string{}
-	if err := cmd.Run(); err != nil {
-		t.Skipf("skipping: exec appears not to work on %s: %v", runtime.GOOS, err)
-	}
-
-	return exe
-}
-
 func TestPanicDoChan(t *testing.T) {
-	if os.Getenv("TEST_PANIC_DOCHAN") != "" {
-		defer func() {
-			recover()
-		}()
+	var g Group
+	ch := g.DoChan("key", func() (any, error) {
+		panic("Panicking in DoChan")
+	})
 
-		g := new(Group)
-		ch := g.DoChan("", func() (any, error) {
-			panic("Panicking in DoChan")
-		})
-		<-ch
-		t.Fatalf("DoChan unexpectedly returned")
+	select {
+	case res := <-ch:
+		if res.Err == nil {
+			t.Fatalf("DoChan returned nil error after panic")
+		}
+		var p *panicError
+		if !errors.As(res.Err, &p) {
+			t.Fatalf("DoChan error = %T; want *panicError", res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DoChan did not deliver a Result after panic")
 	}
 
-	t.Parallel()
-
-	cmd := exec.Command(executable(t), "-test.run="+t.Name(), "-test.v")
-	cmd.Env = append(os.Environ(), "TEST_PANIC_DOCHAN=1")
-	out := new(bytes.Buffer)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-
-	err := cmd.Wait()
-	t.Logf("%s:\n%s", strings.Join(cmd.Args, " "), out)
-	if err == nil {
-		t.Errorf("Test subprocess passed; want a crash due to panic in DoChan")
-	}
-	if bytes.Contains(out.Bytes(), []byte("DoChan unexpectedly")) {
-		t.Errorf("Test subprocess failed with an unexpected failure mode.")
-	}
-	if !bytes.Contains(out.Bytes(), []byte("Panicking in DoChan")) {
-		t.Errorf("Test subprocess failed, but the crash isn't caused by panicking in DoChan")
+	// A later call must not observe the panic as a live call.
+	v, err, _ := g.Do("key", func() (any, error) { return "ok", nil })
+	if err != nil || v != "ok" {
+		t.Fatalf("Do after panic = (%v, %v); want (ok, nil)", v, err)
 	}
 }
 
 func TestPanicDoSharedByDoChan(t *testing.T) {
-	if os.Getenv("TEST_PANIC_DOCHAN") != "" {
-		blocked := make(chan struct{})
-		unblock := make(chan struct{})
+	blocked := make(chan struct{})
+	unblock := make(chan struct{})
+	panicked := make(chan any, 1)
 
-		g := new(Group)
-		go func() {
-			defer func() {
-				recover()
-			}()
-			g.Do("", func() (any, error) {
-				close(blocked)
-				<-unblock
-				panic("Panicking in Do")
-			})
+	var g Group
+	go func() {
+		defer func() {
+			panicked <- recover()
 		}()
-
-		<-blocked
-		ch := g.DoChan("", func() (any, error) {
-			panic("DoChan unexpectedly executed callback")
+		g.Do("key", func() (any, error) {
+			close(blocked)
+			<-unblock
+			panic("Panicking in Do")
 		})
-		close(unblock)
-		<-ch
-		t.Fatalf("DoChan unexpectedly returned")
+	}()
+
+	<-blocked
+	ch := g.DoChan("key", func() (any, error) {
+		panic("DoChan unexpectedly executed callback")
+	})
+	close(unblock)
+
+	if r := <-panicked; r == nil {
+		t.Fatal("Do did not propagate the panic to its caller")
 	}
 
-	t.Parallel()
+	select {
+	case res := <-ch:
+		if res.Err == nil {
+			t.Fatalf("DoChan returned nil error for a panicking call")
+		}
+		if !strings.Contains(res.Err.Error(), "Panicking in Do") {
+			t.Fatalf("DoChan error = %v; want it to describe the panic in Do", res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DoChan did not deliver a Result for a panicking call")
+	}
+}
 
-	cmd := exec.Command(executable(t), "-test.run="+t.Name(), "-test.v")
-	cmd.Env = append(os.Environ(), "TEST_PANIC_DOCHAN=1")
-	out := new(bytes.Buffer)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+func TestGoexitDoChan(t *testing.T) {
+	var g Group
+	ch := g.DoChan("key", func() (any, error) {
+		runtime.Goexit()
+		return nil, nil
+	})
+
+	select {
+	case res := <-ch:
+		if res.Err != errGoexit {
+			t.Fatalf("DoChan error = %v; want %v", res.Err, errGoexit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DoChan did not deliver a Result after runtime.Goexit")
+	}
+}
+
+// TestForgetLateCompletionDoesNotDeleteNewCall verifies that an older
+// generation finishing after Forget cannot remove the newer call.
+func TestForgetLateCompletionDoesNotDeleteNewCall(t *testing.T) {
+	var g Group
+
+	firstStarted := make(chan struct{})
+	unblockFirst := make(chan struct{})
+	firstResult := make(chan any, 1)
+
+	go func() {
+		v, _, _ := g.Do("key", func() (any, error) {
+			close(firstStarted)
+			<-unblockFirst
+			return "first", nil
+		})
+		firstResult <- v
+	}()
+	<-firstStarted
+	g.Forget("key")
+
+	secondStarted := make(chan struct{})
+	unblockSecond := make(chan struct{})
+	secondResult := make(chan any, 1)
+	go func() {
+		v, _, _ := g.Do("key", func() (any, error) {
+			close(secondStarted)
+			<-unblockSecond
+			return "second", nil
+		})
+		secondResult <- v
+	}()
+	<-secondStarted
+
+	// The old generation completes first. Its conditional delete must
+	// not remove the second, still in-flight call.
+	close(unblockFirst)
+	if v := <-firstResult; v != "first" {
+		t.Fatalf("first caller got %v; want first", v)
 	}
 
-	err := cmd.Wait()
-	t.Logf("%s:\n%s", strings.Join(cmd.Args, " "), out)
-	if err == nil {
-		t.Errorf("Test subprocess passed; want a crash due to panic in Do shared by DoChan")
+	thirdStarted := make(chan struct{})
+	thirdResult := make(chan Result, 1)
+	go func() {
+		thirdResult <- <-g.DoChan("key", func() (any, error) {
+			close(thirdStarted)
+			return "third", nil
+		})
+	}()
+
+	// Wait until the third caller has joined the second generation.
+	waitForDups(t, &g, "key", 1)
+	select {
+	case <-thirdStarted:
+		t.Fatal("third caller ran a new function; want it to share the second call")
+	default:
 	}
-	if bytes.Contains(out.Bytes(), []byte("DoChan unexpectedly")) {
-		t.Errorf("Test subprocess failed with an unexpected failure mode.")
+
+	close(unblockSecond)
+	if v := <-secondResult; v != "second" {
+		t.Fatalf("second caller got %v; want second", v)
 	}
-	if !bytes.Contains(out.Bytes(), []byte("Panicking in Do")) {
-		t.Errorf("Test subprocess failed, but the crash isn't caused by panicking in Do")
+	res := <-thirdResult
+	if res.Val != "second" || res.Err != nil {
+		t.Fatalf("third caller got (%v, %v); want (second, nil)", res.Val, res.Err)
 	}
+	if !res.Shared {
+		t.Error("third caller got Shared = false; want true")
+	}
+}
+
+// TestForgetDoesNotCancelInFlightGeneration verifies that Forget leaves
+// already-started work running for the callers that joined it.
+func TestForgetDoesNotCancelInFlightGeneration(t *testing.T) {
+	var g Group
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	result := make(chan string, 1)
+
+	go func() {
+		v, err, _ := g.Do("key", func() (any, error) {
+			close(started)
+			<-unblock
+			return "first", nil
+		})
+		if err != nil {
+			t.Errorf("Do error: %v", err)
+			result <- ""
+			return
+		}
+		result <- v.(string)
+	}()
+	<-started
+
+	// Forget while the first generation is still running, then start a
+	// second generation. Both must be able to finish.
+	g.Forget("key")
+
+	secondDone := make(chan struct{})
+	go func() {
+		v, err, _ := g.Do("key", func() (any, error) { return "second", nil })
+		if err != nil {
+			t.Errorf("second Do error: %v", err)
+		}
+		if v != "second" {
+			t.Errorf("second Do = %v; want second", v)
+		}
+		close(secondDone)
+	}()
+	close(unblock)
+
+	select {
+	case v := <-result:
+		if v != "first" {
+			t.Fatalf("first caller got %v; want first", v)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Forget canceled or stranded an in-flight generation")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("the generation started after Forget did not complete")
+	}
+}
+
+func TestDoContextCancelDoesNotAffectOthers(t *testing.T) {
+	var g Group
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	leader := make(chan Result, 1)
+	go func() {
+		v, err, _ := g.Do("key", func() (any, error) {
+			close(started)
+			<-unblock
+			return "shared", nil
+		})
+		leader <- Result{Val: v, Err: err}
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	canceled := make(chan error, 1)
+	go func() {
+		_, err, _ := g.DoContext(ctx, "key", func() (any, error) {
+			t.Error("DoContext executed its own function instead of joining")
+			return nil, nil
+		})
+		canceled <- err
+	}()
+
+	// Wait for the DoContext caller to join, then cancel it. The leader's
+	// work must be unaffected.
+	waitForDups(t, &g, "key", 1)
+	cancel()
+
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DoContext error = %v; want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DoContext did not return after cancellation")
+	}
+
+	close(unblock)
+	select {
+	case res := <-leader:
+		if res.Err != nil || res.Val != "shared" {
+			t.Fatalf("leader = (%v, %v); want (shared, nil)", res.Val, res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceling one waiter stopped the shared call")
+	}
+}
+
+func TestDoChanContextCancelDeliversOnce(t *testing.T) {
+	var g Group
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	leader := g.DoChan("key", func() (any, error) {
+		close(started)
+		<-unblock
+		return "shared", nil
+	})
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := g.DoChanContext(ctx, "key", func() (any, error) {
+		t.Error("DoChanContext executed its own function instead of joining")
+		return nil, nil
+	})
+	waitForDups(t, &g, "key", 1)
+	cancel()
+
+	select {
+	case res := <-ch:
+		if !errors.Is(res.Err, context.Canceled) {
+			t.Fatalf("DoChanContext Err = %v; want context.Canceled", res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DoChanContext did not deliver a Result after cancellation")
+	}
+
+	// A cancellation must not be delivered to the channel a second time,
+	// and the leader must still receive its result.
+	close(unblock)
+	select {
+	case res := <-leader:
+		if res.Val != "shared" || res.Err != nil {
+			t.Fatalf("leader = (%v, %v); want (shared, nil)", res.Val, res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceling one DoChan waiter stopped the shared call")
+	}
+	select {
+	case res := <-ch:
+		t.Fatalf("DoChanContext delivered a second Result: %+v", res)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// waitForDups waits until the current generation of key has at least n
+// duplicate callers.
+func waitForDups(t *testing.T, g *Group, key string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		g.mu.Lock()
+		c := g.m[key]
+		dups := -1
+		if c != nil {
+			dups = c.dups
+		}
+		g.mu.Unlock()
+		if dups >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d duplicate callers; have %d", n, dups)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDoChanEveryWaiterGetsOneResult(t *testing.T) {
+	var g Group
+
+	unblock := make(chan struct{})
+	const n = 8
+	var wg sync.WaitGroup
+	var results int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch := g.DoChan("key", func() (any, error) {
+				<-unblock
+				return "v", nil
+			})
+			res := <-ch
+			if res.Val != "v" || res.Err != nil {
+				t.Errorf("DoChan = (%v, %v); want (v, nil)", res.Val, res.Err)
+			}
+			atomic.AddInt32(&results, 1)
+		}()
+	}
+
+	waitForDups(t, &g, "key", n-1)
+	close(unblock)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("some DoChan waiters never received a result")
+	}
+	if got := atomic.LoadInt32(&results); got != n {
+		t.Fatalf("got %d results; want %d", got, n)
+	}
+}
+
+func TestPanicEveryWaiterGetsOneResult(t *testing.T) {
+	var g Group
+
+	unblock := make(chan struct{})
+	const n = 8
+	var wg sync.WaitGroup
+	delivered := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch := g.DoChan("key", func() (any, error) {
+				<-unblock
+				panic("boom")
+			})
+			delivered <- (<-ch).Err
+		}()
+	}
+
+	waitForDups(t, &g, "key", n-1)
+	close(unblock)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("some DoChan waiters were blocked by a panic")
+	}
+	close(delivered)
+	for err := range delivered {
+		var p *panicError
+		if !errors.As(err, &p) {
+			t.Fatalf("DoChan Err = %T (%v); want *panicError", err, err)
+		}
+	}
+}
+
+func TestGoexitEveryWaiterGetsOneResult(t *testing.T) {
+	var g Group
+
+	unblock := make(chan struct{})
+	const n = 8
+	var wg sync.WaitGroup
+	delivered := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch := g.DoChan("key", func() (any, error) {
+				<-unblock
+				runtime.Goexit()
+				return nil, nil
+			})
+			delivered <- (<-ch).Err
+		}()
+	}
+
+	waitForDups(t, &g, "key", n-1)
+	close(unblock)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("some DoChan waiters were blocked by runtime.Goexit")
+	}
+	close(delivered)
+	for err := range delivered {
+		if err != errGoexit {
+			t.Fatalf("DoChan Err = %v; want %v", err, errGoexit)
+		}
+	}
+}
+
+// TestDoContextLeaderCancelDoesNotStopWork verifies that a context-aware
+// caller that starts the call can abandon its wait without canceling the
+// shared work for the callers that joined it.
+func TestDoContextLeaderCancelDoesNotStopWork(t *testing.T) {
+	var g Group
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	var calls int32
+
+	ctx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err, _ := g.DoContext(ctx, "key", func() (any, error) {
+			atomic.AddInt32(&calls, 1)
+			close(started)
+			<-unblock
+			return "shared", nil
+		})
+		leaderErr <- err
+	}()
+	<-started
+	cancel()
+
+	select {
+	case err := <-leaderErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled leader returned %v; want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled leader did not return")
+	}
+
+	// A caller that joined the same generation still gets its result.
+	follower := make(chan Result, 1)
+	go func() {
+		v, err, _ := g.Do("key", func() (any, error) {
+			t.Error("follower executed its own function")
+			return nil, nil
+		})
+		follower <- Result{Val: v, Err: err}
+	}()
+	waitForDups(t, &g, "key", 1)
+
+	close(unblock)
+	select {
+	case res := <-follower:
+		if res.Val != "shared" || res.Err != nil {
+			t.Fatalf("follower = (%v, %v); want (shared, nil)", res.Val, res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceling the starting caller stopped the shared work")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("fn ran %d times; want 1", got)
+	}
+}
+
+// TestConcurrentForgetLifecycle hammers Forget against new generations
+// and verifies that every caller still receives exactly one terminal
+// outcome and no call leaks in the key table.
+func TestConcurrentForgetLifecycle(t *testing.T) {
+	var g Group
+
+	stop := make(chan struct{})
+	forgetDone := make(chan struct{})
+	go func() {
+		defer close(forgetDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				g.Forget("key")
+			}
+		}
+	}()
+
+	const n = 32
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			switch i % 3 {
+			case 0:
+				v, err, _ := g.Do("key", func() (any, error) { return i, nil })
+				if err != nil || v == nil {
+					t.Errorf("Do = (%v, %v); want a value and nil error", v, err)
+				}
+			case 1:
+				res := <-g.DoChan("key", func() (any, error) { return i, nil })
+				if res.Err != nil || res.Val == nil {
+					t.Errorf("DoChan = (%v, %v); want a value and nil error", res.Val, res.Err)
+				}
+			case 2:
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				_, err, _ := g.DoContext(ctx, "key", func() (any, error) { return i, nil })
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("DoContext with canceled ctx = %v; want context.Canceled", err)
+				}
+			}
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callers did not all terminate")
+	}
+	close(stop)
+	<-forgetDone
 }
 
 func ExampleGroup() {
